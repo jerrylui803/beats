@@ -29,6 +29,8 @@ import (
 
 	k8sclient "k8s.io/client-go/kubernetes"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
 	"github.com/elastic/elastic-agent-autodiscover/kubernetes"
 	"github.com/elastic/elastic-agent-autodiscover/kubernetes/metadata"
 	"github.com/elastic/elastic-agent-libs/config"
@@ -36,6 +38,7 @@ import (
 	"github.com/elastic/elastic-agent-libs/mapstr"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
+	"github.com/elastic/beats/v7/libbeat/otel/otelmap"
 	"github.com/elastic/beats/v7/libbeat/processors"
 )
 
@@ -400,6 +403,51 @@ func (k *kubernetesAnnotator) Run(event *beat.Event) (*beat.Event, error) {
 	event.Fields.DeepUpdate(kubeMeta)
 
 	return event, nil
+}
+
+// RunPdata enriches the given pcommon.Map directly with Kubernetes metadata,
+// avoiding the round-trip conversion to/from mapstr.M used by the standard Run path.
+// MetadataIndex requires a mapstr.M, so ToMapstr (body.AsRaw) is called once
+// for the index lookup; the write path operates directly on pcommon.Map.
+func (k *kubernetesAnnotator) RunPdata(body pcommon.Map) error {
+	if _, ok := body.Get("kubernetes"); ok {
+		return nil
+	}
+	if !k.kubernetesAvailable {
+		return nil
+	}
+
+	index := k.matchers.MetadataIndex(otelmap.ToMapstr(body))
+	if index == "" {
+		k.log.Debug("No container match string, not adding kubernetes data")
+		return nil
+	}
+
+	metadata := k.cache.get(index)
+	if metadata == nil {
+		return nil
+	}
+
+	kubeMeta := metadata.Clone()
+
+	if containerVal, err := kubeMeta.GetValue("kubernetes.container"); err == nil {
+		if cm, ok := containerVal.(mapstr.M); ok {
+			ociContainer := cm.Clone()
+			_ = ociContainer.Delete("name")
+			if img, imgErr := ociContainer.GetValue("image"); imgErr == nil {
+				_ = ociContainer.Delete("image")
+				ociContainer["image"] = mapstr.M{"name": img}
+			}
+			if err := otelmap.MergeMapstrIntoPdata(mapstr.M{"container": ociContainer}, body); err != nil {
+				return err
+			}
+		}
+	}
+
+	_ = kubeMeta.Delete("kubernetes.container.id")
+	_ = kubeMeta.Delete("kubernetes.container.runtime")
+	_ = kubeMeta.Delete("kubernetes.container.image")
+	return otelmap.MergeMapstrIntoPdata(kubeMeta, body)
 }
 
 func (k *kubernetesAnnotator) Close() error {
